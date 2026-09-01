@@ -130,6 +130,60 @@ failure mode for more predictable node sizing. If Standard is required,
 build in a zone-fallback plan (try 2–3 zones) rather than assuming the
 first choice will succeed.
 
+## Issue 6: Grafana BigQuery plugin not pre-installed — [C]
+
+**Symptom:** After deploying Grafana via the community Helm chart,
+"BigQuery" did not appear as an option under Connections → Data sources
+→ Add data source.
+
+**Root cause:** The Helm chart deploys stock Grafana with no
+non-core plugins bundled. The BigQuery data source
+(`grafana-bigquery-datasource`) is a separate plugin that must be
+installed explicitly.
+
+**Fix:**
+```bash
+kubectl exec -it $(kubectl get pod -l app.kubernetes.io/name=grafana -o jsonpath='{.items[0].metadata.name}') \
+  -- grafana-cli plugins install grafana-bigquery-datasource
+kubectl rollout restart deployment grafana
+```
+Plugin appeared after the pod restarted (~30 seconds).
+
+**Prevention:** For a Helm-deployed Grafana that needs a non-core data
+source, either install the plugin via `grafana-cli` post-deploy (as
+above) or set `GF_INSTALL_PLUGINS=grafana-bigquery-datasource` as an
+environment variable in the Helm values at install time, which installs
+it automatically on first boot rather than requiring a manual exec + restart.
+
+## Issue 7: BigQuery data source auth failed — Cloud Resource Manager API disabled — [C]
+
+**Symptom:** After configuring the BigQuery data source with a valid
+service account JWT key, "Save & Test" failed:
+```
+[auth] Error connecting to resource manager: googleapi: Error 403:
+Cloud Resource Manager API has not been used in project ... before or
+it is disabled.
+```
+
+**Root cause:** The Grafana BigQuery plugin validates project access via
+the Cloud Resource Manager API in addition to the BigQuery API itself.
+This API was not part of the original `gcloud services enable` batch run
+during initial project setup (only `container`, `bigquery`, `logging`,
+and `monitoring` were enabled).
+
+**Fix:**
+```bash
+gcloud services enable cloudresourcemanager.googleapis.com
+```
+Waited ~1–2 minutes for propagation, then retried "Save & Test" in
+Grafana — succeeded.
+
+**Prevention:** When a GCP integration authenticates via a service
+account, check whether the *client library or plugin itself* calls
+additional APIs beyond the obvious one (here, Resource Manager alongside
+BigQuery) — the error message named the exact API and provided a direct
+enablement link, which made this a fast fix once identified.
+
 ---
 
 ## Suggested framing for your write-up

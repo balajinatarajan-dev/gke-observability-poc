@@ -42,13 +42,58 @@ Issue 5 for the full diagnostic path).
   Autopilot's per-pod allocation — documented as a real finding, not a
   hypothetical comparison
 
-### 2.3 Logging pipeline (Cluster 1 only)
-- Cloud Logging → BigQuery sink configured and verified on Cluster 1
-  (`gke_logs` dataset, `stderr_<date>` table — see `troubleshooting.md`
-  Issue 4 on table naming)
-- **Not yet replicated to Cluster 2** — see §4, "Not implemented"
+### 2.3 Logging pipeline (both clusters)
+- Cloud Logging → BigQuery sink configured and verified on **both**
+  clusters (`gke_logs` dataset, `stderr_<date>` tables — see
+  `troubleshooting.md` Issue 4 on table naming). Each cluster has its own
+  sink (`gke-to-bq`, `gke-to-bq-east`) filtered by `cluster_name`, both
+  writing into the same dataset, sharing one Cloud Logging service
+  account identity that GCP provisions per-project rather than per-sink
+- Verified cross-cluster query: rows from both `bn-observability-poc` and
+  `bn-observability-poc-east` are queryable together via a wildcard table
+  reference (`gke_logs.stderr_2026*`) — see `bigquery/sample_queries.sql`
 
-## 3. What "two clusters" does and doesn't demonstrate
+### 2.4 Visualization layer (Grafana)
+- Self-hosted Grafana deployed via the official Helm chart onto Cluster 1
+  (Cloud-hosted managed Grafana is not part of GCP's free tier)
+- BigQuery connected as a data source using a dedicated, least-privilege
+  service account (`grafana-bigquery-reader`, scoped to
+  `roles/bigquery.dataViewer` + `roles/bigquery.jobUser` only — not the
+  broader Editor role)
+- BigQuery datasource plugin required the Cloud Resource Manager API to
+  be separately enabled (not part of the original API-enablement batch)
+  — see `troubleshooting.md` Issue 6
+- Four-panel dashboard built (`grafana/dashboard.json`), all backed by
+  real queries against live data:
+  1. Request volume over time, by cluster
+  2. Log activity by pod
+  3. Requests and active-pod count by cluster
+  4. Recent request log (raw tail)
+
+## 3.5 A real finding from the data, not a hypothetical
+
+The "Requests by cluster" panel surfaced a genuine, unplanned data point
+worth calling out rather than a constructed comparison:
+
+| Cluster | Total requests (cumulative) | Distinct active pods |
+|---|---|---|
+| `bn-observability-poc` (Standard, 1 node) | 3574 | 1 |
+| `bn-observability-poc-east` (Autopilot) | 22 | 5 |
+
+Cluster 1 accumulated far more total request volume (from earlier,
+repeated manual testing), but only ever had **one** pod actually serving
+traffic — consistent with the single-node capacity limit documented in
+`troubleshooting.md` Issue 2. Cluster 2 saw much less cumulative traffic
+but shows **five** distinct pods having served requests over its
+lifetime — consistent with Autopilot's more flexible, per-pod scheduling
+and the fact its replica set was never capacity-constrained.
+
+This is real evidence of the Standard-vs-Autopilot operational trade-off
+discussed in §2.2, pulled directly from the observability pipeline this
+project built — not asserted from general knowledge of how the two modes
+are supposed to differ.
+
+## 4. What "two clusters" does and doesn't demonstrate
 
 This is the section most worth reading carefully, since it's where the
 original design's ambitions and this PoC's actual scope diverge most.
@@ -76,18 +121,20 @@ pipeline) and that they can exist in two regions simultaneously. It does
 clusters" meaningfully more resilient than one — that layer was
 identified as scope, not attempted, given the 2-day window.
 
-## 4. Not implemented (by design, given timeline)
+## 5. Not implemented (by design, given timeline)
 
 | Original design element | Status | What it would take |
 |---|---|---|
 | Multi-cluster Ingress / global HTTPS LB | Not built | Fleet registration, config cluster, NEGs, global external LB — adds real hourly cost beyond free tier |
 | Automatic failover | Not built | Requires MCI above, plus health-check configuration |
-| BigQuery logging sink on Cluster 2 | Not built | Mechanically identical to Cluster 1's sink — could be added by repeating §2.3's steps against Cluster 2, scoped to Day 2 if time allows |
-| Grafana | Pending Day 2 | Self-hosted via Helm, planned against Cluster 1's BigQuery data |
+| BigQuery logging sink on Cluster 2 | ✅ Built | Both clusters now feed the same `gke_logs` dataset — see §2.3 |
+| Grafana dashboard | ✅ Built | Self-hosted via Helm on Cluster 1, connected to BigQuery — see §2.4 |
 | Anthos Service Mesh | Not built | Paid add-on; unnecessary for two independent, non-communicating services |
 | Cloud Armor, Binary Authorization | Not built | Both attach to infrastructure (global LB, CI/CD attestation) not present in this scope |
+| Request latency percentiles (p50/p95/p99) panel | Not built | The demo app's plain-text stderr logs have no duration/latency field; would need either a different app logging structured JSON with request duration, or pulling from Cloud Monitoring's GKE ingress metrics instead of BigQuery logs |
+| True application error-rate panel | Not built | `hello-app` never logs at ERROR severity; request volume was substituted as the closest available signal — see `bigquery/sample_queries.sql` |
 
-## 5. Design decisions and rationale (updated)
+## 6. Design decisions and rationale (updated)
 
 - **Two clusters were added** after reviewing the original requirement
   doc against the initial single-cluster plan — the "two GKE clusters"
@@ -104,11 +151,12 @@ identified as scope, not attempted, given the 2-day window.
   out of scope, since a failover claim that wasn't actually tested is
   more misleading than no claim at all
 
-## 6. Repo contents
+## 7. Repo contents
 
 - `k8s/app-deployment.yaml` — manifest deployed identically to both clusters
 - `docs/command-log.md` — full command log, source-tagged against the
   original attachment vs. chat debugging
-- `docs/troubleshooting.md` — five documented issues, including the
-  GCE_STOCKOUT/Autopilot pivot
-- `bigquery/`, `grafana/` — Day 2 deliverables (pending)
+- `docs/troubleshooting.md` — documented issues, including the
+  GCE_STOCKOUT/Autopilot pivot and the Grafana/BigQuery plugin setup
+- `bigquery/sample_queries.sql` — the four queries backing the dashboard
+- `grafana/dashboard.json` — exported dashboard definition
