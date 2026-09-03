@@ -184,16 +184,152 @@ additional APIs beyond the obvious one (here, Resource Manager alongside
 BigQuery) — the error message named the exact API and provided a direct
 enablement link, which made this a fast fix once identified.
 
+## Issue 8: Fleet registration failed — Workload Identity not enabled on Standard cluster — [C]
+
+**Symptom:**
+```
+gcloud container fleet memberships register cluster1-membership ...
+ERROR: FAILED_PRECONDITION: Workload Identity is not enabled on your
+GKE cluster "...bn-observability-poc". Please enable GKE Workload
+Identity first...
+```
+Cluster 2 (Autopilot) registered on the first attempt with the exact
+same command; Cluster 1 (Standard) did not.
+
+**Root cause:** GKE Autopilot clusters have Workload Identity enabled by
+default; GKE Standard clusters do not, and the Fleet registration
+command's `--enable-workload-identity` flag configures the *membership*
+side of the relationship, not the cluster side — the cluster itself
+needs a separate, explicit update first.
+
+**Fix:**
+```bash
+gcloud container clusters update bn-observability-poc \
+  --zone=us-central1-a \
+  --workload-pool=balaji-gcp-obs-poc-01.svc.id.goog
+```
+This is a control-plane update, took roughly 7 minutes
+(`17:11:38` → `17:18:50`). Fleet registration retried successfully
+immediately after.
+
+**Prevention:** Before registering a Standard cluster to a Fleet, check
+Workload Identity status directly rather than assuming the register
+command will handle it:
+```bash
+gcloud container clusters describe <cluster> --zone=<zone> \
+  --format="value(workloadIdentityConfig.workloadPool)"
+```
+Empty output means it needs to be enabled first — budget the ~10 minute
+control-plane update time into the plan.
+
+## Issue 9: Fleet ingress enable — membership path used zone instead of region — [C]
+
+**Symptom:**
+```
+gcloud container fleet ingress enable \
+  --config-membership=projects/.../locations/us-central1-a/memberships/cluster1-membership
+ERROR: INVALID_ARGUMENT: Membership "...locations/us-central1-a/memberships/cluster1-membership" does not exist
+```
+
+**Root cause:** `gcloud container fleet memberships list` displays
+`LOCATION: us-central1` (the region) for this membership, even though
+the underlying cluster is zonal (`us-central1-a`). The membership
+resource path itself is keyed by region, not the cluster's zone — using
+the zone in the path looks plausible but resolves to a non-existent
+resource.
+
+**Fix:** Re-ran with the region in the path instead of the zone:
+```bash
+gcloud container fleet ingress enable \
+  --config-membership=projects/balaji-gcp-obs-poc-01/locations/us-central1/memberships/cluster1-membership
+```
+
+**Prevention:** Always copy the exact `LOCATION` value shown by
+`gcloud container fleet memberships list` for membership-path arguments,
+rather than substituting the cluster's own zone/region from memory —
+they aren't always the same string even when related.
+
+## Issue 10: Failover test — target cluster had zero running pods when needed — [C]
+
+**Symptom:** During a live failover test (Cluster 2 scaled to 0 to
+simulate an outage), the global LB correctly returned `502 Bad Gateway`
+— but the 502 persisted well past the expected health-check detection
+window. Checking Cluster 1 (the intended failover target) directly
+showed **zero running `web-app-a` pods** — both replicas `Pending`.
+
+**Root cause (two layers):**
+1. **Immediate cause:** Cluster 1's HPA still had `minReplicas: 2` from
+   earlier configuration, which kept recreating a second pod attempt
+   every time a manual scale-to-1 was tried, causing rapid pod churn
+   rather than a stable single replica.
+2. **Underlying cause, found after fixing (1):** even with HPA corrected
+   and only 1 replica requested, the pod still would not schedule —
+   `Insufficient cpu`, with node CPU allocation at 90%. Investigating
+   further (`kubectl get pods -A -o wide`) showed several GKE-managed
+   system pods present that were not there before this session —
+   `gke-mcs-importer`, GKE Managed Prometheus components under
+   `gmp-system` — added automatically as a side effect of registering
+   the cluster to a Fleet and enabling Multi-cluster Ingress earlier the
+   same session. This system overhead alone consumed enough of the
+   single node's capacity to block the application pod.
+
+**Fix:**
+```bash
+kubectl patch hpa web-app-a --patch '{"spec":{"minReplicas":1}}'
+gcloud container clusters resize bn-observability-poc \
+  --node-pool=default-pool --num-nodes=2 --zone=us-central1-a
+```
+Resizing to 2 nodes gave enough headroom for both the new MCI-related
+system pods and the application pod. Once the pod reached `Running`, the
+LB detected it within roughly a minute and traffic shifted cleanly —
+confirmed via 10 consecutive requests all landing on Cluster 1
+(`Via: 1.1 google` header confirmed LB routing, not a direct connection).
+
+**Prevention:** Enabling Fleet membership and Multi-cluster Ingress adds
+real, permanent system-pod overhead to every participating cluster —
+this should be accounted for in node sizing *before* enabling these
+features, not discovered when a failover event actually needs the spare
+capacity. For small/free-tier clusters specifically, budget at least one
+extra node's worth of headroom beyond application requirements once MCI
+is in the picture.
+
+## Issue 11: HPA fighting manual `kubectl scale` during troubleshooting — [C]
+
+**Symptom:** While debugging Issue 10, `kubectl scale deployment
+web-app-a --replicas=1` did not produce a stable single pod — instead,
+`kubectl get pods --watch` showed a pod name repeatedly appearing at
+`0s` age, i.e., being created and immediately deleted in a loop.
+
+**Root cause:** The Deployment's HPA (`kubectl get hpa`) still had
+`MINPODS: 2` configured from earlier (Day 1) testing. HPA continuously
+reconciles toward its own min/max regardless of manual `kubectl scale`
+commands, so the manual scale-to-1 and the HPA's enforced minimum-of-2
+were fighting each other on every reconcile loop.
+
+**Fix:**
+```bash
+kubectl patch hpa web-app-a --patch '{"spec":{"minReplicas":1}}'
+```
+Pod churn stopped immediately after.
+
+**Prevention:** Before manually scaling a Deployment that has an HPA
+attached, check the HPA's own min/max first (`kubectl get hpa`) — a
+manual scale command that conflicts with the HPA's bounds will not hold
+and can produce a confusing rapid-recreate pattern that looks like a
+scheduling failure rather than a configuration conflict.
+
 ---
 
 ## Suggested framing for your write-up
 
-If your grader wants **one** troubleshooting scenario, **Issue 5
-(GCE_STOCKOUT)** is the strongest candidate: it's an infrastructure-level
-failure (not a typo or missed step), took real diagnostic work to
-confirm the actual cause via operation logs rather than just retrying
-blindly, and led to a genuine architectural decision (Standard →
-Autopilot, different region) rather than a one-line fix. It also produced
-a useful side-by-side data point: Autopilot scheduled all 3 replicas
-where the Standard single-node cluster only fit 1 (Issue 2), which is
-worth calling out explicitly if your write-up compares the two clusters.
+If your grader wants **one** troubleshooting scenario, **Issue 10** (the
+failover-target capacity squeeze caused by enabling MCI itself) is now
+the strongest candidate — it surfaced during a live, high-stakes test
+(not a routine setup step), required diagnosing across two separate
+layers (HPA conflict, then underlying system-pod resource consumption),
+and produced a genuinely non-obvious, transferable lesson: enabling a
+resilience feature (MCI/Fleet) has its own real infrastructure cost that
+must be budgeted into failover-target capacity planning. **Issue 5
+(GCE_STOCKOUT)** remains a strong second choice if a purely
+infrastructure-provisioning story (rather than a live-test discovery) is
+preferred.
