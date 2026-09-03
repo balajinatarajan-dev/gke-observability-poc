@@ -1,0 +1,11 @@
+apiVersion: networking.gke.io/v1
+kind: MultiClusterIngress
+metadata:
+  name: web-app-a-mci
+  namespace: default
+spec:
+  template:
+    spec:
+      backend:
+        serviceName: web-app-a-mcs
+        servicePort: 80

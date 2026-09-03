@@ -1,0 +1,18 @@
+apiVersion: networking.gke.io/v1
+kind: MultiClusterService
+metadata:
+  name: web-app-a-mcs
+  namespace: default
+spec:
+  template:
+    spec:
+      selector:
+        app: web-app-a
+      ports:
+      - name: http
+        protocol: TCP
+        port: 80
+        targetPort: 8080
+  clusters:
+  - link: "us-central1-a/bn-observability-poc"
+  - link: "us-west1/bn-observability-poc-east"
