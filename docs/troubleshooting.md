@@ -1,4 +1,4 @@
-# Troubleshooting Log (source-annotated)
+# Troubleshooting Log 
 
 > **Source key**
 > `[A]` = present in `Charles_Schwab_assignment.txt`
@@ -320,16 +320,3 @@ scheduling failure rather than a configuration conflict.
 
 ---
 
-## Suggested framing for your write-up
-
-If your grader wants **one** troubleshooting scenario, **Issue 10** (the
-failover-target capacity squeeze caused by enabling MCI itself) is now
-the strongest candidate — it surfaced during a live, high-stakes test
-(not a routine setup step), required diagnosing across two separate
-layers (HPA conflict, then underlying system-pod resource consumption),
-and produced a genuinely non-obvious, transferable lesson: enabling a
-resilience feature (MCI/Fleet) has its own real infrastructure cost that
-must be budgeted into failover-target capacity planning. **Issue 5
-(GCE_STOCKOUT)** remains a strong second choice if a purely
-infrastructure-provisioning story (rather than a live-test discovery) is
-preferred.
